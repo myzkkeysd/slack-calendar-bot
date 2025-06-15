@@ -1,18 +1,18 @@
 import os
 import base64
 from dotenv import load_dotenv
-
-load_dotenv()
-
 import re
 import datetime
+import dateparser  # ★ 追加
+
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from slack_bolt import App
 
 # ==========================
-# 環境変数取得
+# 環境変数読み込み
 # ==========================
+load_dotenv()
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
@@ -32,21 +32,53 @@ calendar_service = build('calendar', 'v3', credentials=credentials)
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 
 # ==========================
-# 時刻パース処理
+# 既存: 数字形式のパース
 # ==========================
 
-def parse_time(raw, date_obj):
-    if len(raw) == 2:
-        return datetime.datetime.combine(date_obj, datetime.time(int(raw), 0))
-    elif len(raw) == 4:
-        hour = int(raw[:2])
-        minute = int(raw[2:])
-        return datetime.datetime.combine(date_obj, datetime.time(hour, minute))
+def parse_standard_format(text):
+    match = re.match(r'(?:<@[\w]+>\s*)?(\d{8}) (\d{2,4})-(\d{2,4}) (.+)', text)
+    if not match:
+        return None
+
+    yyyymmdd, start_raw, end_raw, title = match.groups()
+    date_obj = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+
+    def parse_time(raw):
+        if len(raw) == 2:
+            return datetime.datetime.combine(date_obj, datetime.time(int(raw), 0))
+        elif len(raw) == 4:
+            return datetime.datetime.combine(date_obj, datetime.time(int(raw[:2]), int(raw[2:])))
+        else:
+            raise ValueError("時刻フォーマット不正")
+
+    start_time = parse_time(start_raw)
+    end_time = parse_time(end_raw)
+    return start_time, end_time, title
+
+# ==========================
+# 新規: AI自然言語パース
+# ==========================
+
+def parse_natural_language(text):
+    now = datetime.datetime.now()
+
+    dt = dateparser.parse(text, settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': now})
+    if not dt:
+        raise ValueError("日時を認識できませんでした")
+
+    start_time = dt
+    end_time = start_time + datetime.timedelta(hours=1)
+
+    # 簡易タイトル抽出
+    if "から" in text:
+        title = text.split("から")[-1].strip()
     else:
-        raise ValueError("時刻フォーマットが不正です")
+        title = "予定"
+
+    return start_time, end_time, title
 
 # ==========================
-# app_mention処理 (重複防止＋リアクション＋スレッド対応)
+# app_mentionイベント処理
 # ==========================
 
 @app.event("app_mention")
@@ -57,45 +89,43 @@ def handle_app_mention_events(body, client):
 
     client.reactions_add(channel=channel_id, name="thinking_face", timestamp=ts)
 
-    # 柔軟パース：2桁〜4桁まで許容
-    match = re.match(r'(?:<@[\w]+>\s*)?(\d{8}) (\d{2,4})-(\d{2,4}) (.+)', text)
-    if match:
-        yyyymmdd, start_raw, end_raw, title = match.groups()
-        try:
-            date_obj = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
+    try:
+        # ① まず従来フォーマットを優先判定
+        parsed = parse_standard_format(text)
 
-            start_time = parse_time(start_raw, date_obj)
-            end_time = parse_time(end_raw, date_obj)
+        if parsed:
+            start_time, end_time, title = parsed
+        else:
+            # ② ダメならAI自然言語パース
+            start_time, end_time, title = parse_natural_language(text)
 
-            # 重複チェック
-            time_min = (start_time - datetime.timedelta(minutes=1)).isoformat() + 'Z'
-            time_max = (end_time + datetime.timedelta(minutes=1)).isoformat() + 'Z'
+        # 重複チェック
+        time_min = (start_time - datetime.timedelta(minutes=1)).isoformat() + 'Z'
+        time_max = (end_time + datetime.timedelta(minutes=1)).isoformat() + 'Z'
 
-            events_result = calendar_service.events().list(
-                calendarId=GOOGLE_CALENDAR_ID,
-                timeMin=time_min,
-                timeMax=time_max,
-                q=title,
-                singleEvents=True
-            ).execute()
+        events_result = calendar_service.events().list(
+            calendarId=GOOGLE_CALENDAR_ID,
+            timeMin=time_min,
+            timeMax=time_max,
+            q=title,
+            singleEvents=True
+        ).execute()
 
-            existing_events = events_result.get('items', [])
+        existing_events = events_result.get('items', [])
 
-            if existing_events:
-                message = f"⚠ 既に予定が登録されています: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
-            else:
-                event = {
-                    'summary': title,
-                    'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Tokyo'},
-                    'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Tokyo'},
-                }
-                calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-                message = f"✅ Googleカレンダーに登録しました: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
+        if existing_events:
+            message = f"⚠ 既に予定が登録されています: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
+        else:
+            event = {
+                'summary': title,
+                'start': {'dateTime': start_time.isoformat(), 'timeZone': 'Asia/Tokyo'},
+                'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Tokyo'},
+            }
+            calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
+            message = f"✅ Googleカレンダーに登録しました: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
 
-        except Exception as e:
-            message = f"❌ 登録失敗: {e}"
-    else:
-        message = "⚠ 書式が違います。 例: 20250620 14-15 打合せ、または 20250620 1415-1430 打合せ"
+    except Exception as e:
+        message = f"❌ 登録失敗: {e}"
 
     client.chat_postMessage(channel=channel_id, thread_ts=ts, text=message)
     client.reactions_remove(channel=channel_id, name="thinking_face", timestamp=ts)
