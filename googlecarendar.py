@@ -1,66 +1,74 @@
 import os
 import base64
-import re
-import datetime
 import json
-import openai
+import datetime
 from dotenv import load_dotenv
+
+from slack_bolt import App
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from slack_bolt import App
+from openai import OpenAI
 
-# .env読み込み (ローカル用)
+# 環境変数ロード
 load_dotenv()
 
-# 環境変数
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+GOOGLE_SERVICE_ACCOUNT_B64 = os.environ["GOOGLE_SERVICE_ACCOUNT_B64"]
 
-# Googleサービスアカウント復元
-service_account_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
+# service_account.json をRender内で復元
 with open("service_account.json", "w") as f:
-    f.write(base64.b64decode(service_account_b64).decode('utf-8'))
+    f.write(base64.b64decode(GOOGLE_SERVICE_ACCOUNT_B64).decode('utf-8'))
 
 # Google Calendar 認証
+SERVICE_ACCOUNT_FILE = 'service_account.json'
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 credentials = service_account.Credentials.from_service_account_file(
-    "service_account.json", scopes=SCOPES)
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 calendar_service = build('calendar', 'v3', credentials=credentials)
 
-# Slack Bolt初期化
+# Slack & OpenAI初期化
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
-openai.api_key = OPENAI_API_KEY
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# OpenAIによる自然言語解析関数
-def parse_event_with_openai(input_text):
+
+# ==========================
+# AI自然言語パーサー部分
+# ==========================
+
+def parse_schedule_ai(text):
+    today = datetime.date.today()
     prompt = f"""
-あなたはスケジュール登録アシスタントです。
-ユーザーが入力した予定から以下3つを抽出して下さい:
-- 開始日時 (start): ISO8601形式 (例: 2025-06-20T15:30:00)
-- 終了日時 (end): ISO8601形式 (例: 2025-06-20T16:30:00)
-- タイトル (title)
+あなたはスケジュール変換AIです。以下の入力文を読み取り、予定日・開始時刻・終了時刻・予定タイトルを抽出してください。
 
-今日の日付は {datetime.date.today()} です。
-日時が明記されていない場合は適切に補完して下さい。
-出力は必ず次のJSON形式で返してください:
+- 入力に「明日」などがある場合は今日の日付 ({today.strftime('%Y-%m-%d')}) を基準に計算。
+- 日付が欠落している場合は今日の日付を使用。
+- 終了時刻が省略されている場合は開始時刻＋1時間とする。
+- 時刻は24時間表記（例：15:00）に統一。
+- 出力は以下JSONフォーマットのみ許可：
+{{"date": "YYYY-MM-DD", "start": "HH:MM", "end": "HH:MM", "title": "予定タイトル"}}
 
-{{
-"start": "...",
-"end": "...",
-"title": "..."
-}}
-
-ユーザー入力: 「{input_text}」
+入力: {text}
 """
-    response = openai.ChatCompletion.create(
+
+    response = openai_client.chat.completions.create(
         model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
+        messages=[
+            {"role": "system", "content": "あなたはプロの自然言語スケジュール抽出AIです。"},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.1,
     )
-    message = response['choices'][0]['message']['content']
-    return json.loads(message)
+
+    result = response.choices[0].message.content
+    return json.loads(result)
+
+
+# ==========================
+# Slack Event処理
+# ==========================
 
 @app.event("app_mention")
 def handle_app_mention_events(body, client):
@@ -68,45 +76,49 @@ def handle_app_mention_events(body, client):
     channel_id = body.get("event", {}).get("channel")
     ts = body.get("event", {}).get("ts")
 
-    # 処理中リアクション
     client.reactions_add(channel=channel_id, name="thinking_face", timestamp=ts)
 
     try:
-        parsed = parse_event_with_openai(text)
-        start_dt = datetime.datetime.fromisoformat(parsed["start"])
-        end_dt = datetime.datetime.fromisoformat(parsed["end"])
-        title = parsed["title"]
+        parsed = parse_schedule_ai(text)
+
+        date_obj = datetime.datetime.strptime(parsed['date'], "%Y-%m-%d").date()
+        start_time = datetime.datetime.strptime(parsed['start'], "%H:%M").time()
+        end_time = datetime.datetime.strptime(parsed['end'], "%H:%M").time()
+
+        start_dt = datetime.datetime.combine(date_obj, start_time)
+        end_dt = datetime.datetime.combine(date_obj, end_time)
 
         # 重複チェック
         time_min = (start_dt - datetime.timedelta(minutes=1)).isoformat() + 'Z'
         time_max = (end_dt + datetime.timedelta(minutes=1)).isoformat() + 'Z'
+
         events_result = calendar_service.events().list(
             calendarId=GOOGLE_CALENDAR_ID,
             timeMin=time_min,
             timeMax=time_max,
-            q=title,
+            q=parsed['title'],
             singleEvents=True
         ).execute()
 
         existing_events = events_result.get('items', [])
 
         if existing_events:
-            message = f"⚠ 既に予定が登録されています: {title} ({start_dt}〜{end_dt})"
+            message = f"⚠ 既に予定が登録されています: {parsed['title']} ({parsed['start']} - {parsed['end']})"
         else:
             event = {
-                'summary': title,
+                'summary': parsed['title'],
                 'start': {'dateTime': start_dt.isoformat(), 'timeZone': 'Asia/Tokyo'},
                 'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Tokyo'},
             }
             calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-            message = f"✅ Googleカレンダーに登録しました: {title} ({start_dt}〜{end_dt})"
+            message = f"✅ Googleカレンダーに登録しました: {parsed['title']} ({parsed['start']} - {parsed['end']})"
 
     except Exception as e:
         message = f"❌ 登録失敗: {e}"
 
-    # 結果をスレッド返信
     client.chat_postMessage(channel=channel_id, thread_ts=ts, text=message)
     client.reactions_remove(channel=channel_id, name="thinking_face", timestamp=ts)
+
 
 if __name__ == "__main__":
     app.start(port=3000)
