@@ -17,6 +17,10 @@ SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
 SLACK_SIGNING_SECRET = os.environ["SLACK_SIGNING_SECRET"]
 GOOGLE_CALENDAR_ID = os.environ["GOOGLE_CALENDAR_ID"]
 
+service_account_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
+with open("service_account.json", "w") as f:
+    f.write(base64.b64decode(service_account_b64).decode('utf-8'))
+
 # サービスアカウントJSONファイル
 SERVICE_ACCOUNT_FILE = 'service_account.json'
 
