@@ -1,3 +1,8 @@
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import re
 import datetime
 from googleapiclient.discovery import build
