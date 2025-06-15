@@ -11,7 +11,7 @@ from google.oauth2 import service_account
 from slack_bolt import App
 
 # ==========================
-# ① ここをあなたの環境に合わせて設定
+# 環境変数取得
 # ==========================
 
 SLACK_BOT_TOKEN = os.environ["SLACK_BOT_TOKEN"]
@@ -22,10 +22,9 @@ service_account_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64")
 with open("service_account.json", "w") as f:
     f.write(base64.b64decode(service_account_b64).decode('utf-8'))
 
-# サービスアカウントJSONファイル
 SERVICE_ACCOUNT_FILE = 'service_account.json'
-
 SCOPES = ['https://www.googleapis.com/auth/calendar']
+
 credentials = service_account.Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE, scopes=SCOPES)
 calendar_service = build('calendar', 'v3', credentials=credentials)
@@ -33,7 +32,21 @@ calendar_service = build('calendar', 'v3', credentials=credentials)
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 
 # ==========================
-# ② app_mention処理 (重複防止＋リアクション＋スレッド対応)
+# 時刻パース処理
+# ==========================
+
+def parse_time(raw, date_obj):
+    if len(raw) == 2:
+        return datetime.datetime.combine(date_obj, datetime.time(int(raw), 0))
+    elif len(raw) == 4:
+        hour = int(raw[:2])
+        minute = int(raw[2:])
+        return datetime.datetime.combine(date_obj, datetime.time(hour, minute))
+    else:
+        raise ValueError("時刻フォーマットが不正です")
+
+# ==========================
+# app_mention処理 (重複防止＋リアクション＋スレッド対応)
 # ==========================
 
 @app.event("app_mention")
@@ -42,16 +55,17 @@ def handle_app_mention_events(body, client):
     channel_id = body.get("event", {}).get("channel")
     ts = body.get("event", {}).get("ts")
 
-    # 処理中リアクション追加
     client.reactions_add(channel=channel_id, name="thinking_face", timestamp=ts)
 
-    match = re.match(r'(?:<@[\w]+>\s*)?(\d{8}) (\d{1,2})-(\d{1,2}) (.+)', text)
+    # 柔軟パース：2桁〜4桁まで許容
+    match = re.match(r'(?:<@[\w]+>\s*)?(\d{8}) (\d{2,4})-(\d{2,4}) (.+)', text)
     if match:
-        yyyymmdd, start_h, end_h, title = match.groups()
+        yyyymmdd, start_raw, end_raw, title = match.groups()
         try:
             date_obj = datetime.datetime.strptime(yyyymmdd, "%Y%m%d").date()
-            start_time = datetime.datetime.combine(date_obj, datetime.time(int(start_h)))
-            end_time = datetime.datetime.combine(date_obj, datetime.time(int(end_h)))
+
+            start_time = parse_time(start_raw, date_obj)
+            end_time = parse_time(end_raw, date_obj)
 
             # 重複チェック
             time_min = (start_time - datetime.timedelta(minutes=1)).isoformat() + 'Z'
@@ -68,7 +82,7 @@ def handle_app_mention_events(body, client):
             existing_events = events_result.get('items', [])
 
             if existing_events:
-                message = f"⚠ 既に予定が登録されています: {title} ({start_h}:00 - {end_h}:00)"
+                message = f"⚠ 既に予定が登録されています: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
             else:
                 event = {
                     'summary': title,
@@ -76,21 +90,18 @@ def handle_app_mention_events(body, client):
                     'end': {'dateTime': end_time.isoformat(), 'timeZone': 'Asia/Tokyo'},
                 }
                 calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-                message = f"✅ Googleカレンダーに登録しました: {title} ({start_h}:00 - {end_h}:00)"
+                message = f"✅ Googleカレンダーに登録しました: {title} ({start_time.strftime('%H:%M')} - {end_time.strftime('%H:%M')})"
 
         except Exception as e:
             message = f"❌ 登録失敗: {e}"
     else:
-        message = "⚠ 書式が違います。 例: 20250620 14-15 打合せ"
+        message = "⚠ 書式が違います。 例: 20250620 14-15 打合せ、または 20250620 1415-1430 打合せ"
 
-    # スレッドでメッセージ投稿
     client.chat_postMessage(channel=channel_id, thread_ts=ts, text=message)
-
-    # リアクション削除
     client.reactions_remove(channel=channel_id, name="thinking_face", timestamp=ts)
 
 # ==========================
-# ③ サーバ起動
+# サーバ起動
 # ==========================
 
 if __name__ == "__main__":
