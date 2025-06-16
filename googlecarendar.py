@@ -33,10 +33,8 @@ calendar_service = build('calendar', 'v3', credentials=credentials)
 app = App(token=SLACK_BOT_TOKEN, signing_secret=SLACK_SIGNING_SECRET)
 openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-
-# ==========================
-# AI自然言語パーサー部分
-# ==========================
+# 日本語曜日変換
+WEEKDAYS_JA = ["月", "火", "水", "木", "金", "土", "日"]
 
 def parse_schedule_ai(text):
     today = datetime.date.today()
@@ -64,11 +62,6 @@ def parse_schedule_ai(text):
 
     result = response.choices[0].message.content
     return json.loads(result)
-
-
-# ==========================
-# Slack Event処理
-# ==========================
 
 @app.event("app_mention")
 def handle_app_mention_events(body, client):
@@ -104,6 +97,7 @@ def handle_app_mention_events(body, client):
 
         if existing_events:
             message = f"⚠ 既に予定が登録されています: {parsed['title']} ({parsed['start']} - {parsed['end']})"
+            client.reactions_add(channel=channel_id, name="x", timestamp=ts)
         else:
             event = {
                 'summary': parsed['title'],
@@ -111,14 +105,20 @@ def handle_app_mention_events(body, client):
                 'end': {'dateTime': end_dt.isoformat(), 'timeZone': 'Asia/Tokyo'},
             }
             calendar_service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event).execute()
-            message = f"✅ Googleカレンダーに登録しました: {parsed['title']} ({parsed['start']} - {parsed['end']})"
+
+            weekday = WEEKDAYS_JA[date_obj.weekday()]
+            formatted_date = f"{date_obj.year}/{date_obj.month:02}/{date_obj.day:02} ({weekday})"
+            formatted_time = f"{parsed['start']} - {parsed['end']}"
+
+            message = f"✅ Googleカレンダー登録完了しました。\n\n{formatted_date} {formatted_time} {parsed['title']}"
+            client.reactions_add(channel=channel_id, name="white_check_mark", timestamp=ts)
 
     except Exception as e:
         message = f"❌ 登録失敗: {e}"
+        client.reactions_add(channel=channel_id, name="x", timestamp=ts)
 
     client.chat_postMessage(channel=channel_id, thread_ts=ts, text=message)
     client.reactions_remove(channel=channel_id, name="thinking_face", timestamp=ts)
-
 
 if __name__ == "__main__":
     app.start(port=3000)
